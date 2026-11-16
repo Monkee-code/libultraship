@@ -787,6 +787,21 @@ int gGdxTraceSeq = 0;
 // Set by the port bridge when a race venue is loaded; menu screens would
 // otherwise exhaust the probe caps before a race is reached.
 extern "C" int gGdxRaceActive = 0;
+// The SETTIMG race trace (GDX_DIAG_SETTIMG). Its two readers run on every texture lookup and every TMEM store,
+// hundreds of times a frame, and the MSVC getenv locks and walks the whole environment block on each call: read
+// live, it cost the G-NET room screen about 11 ms a frame on Windows. Both readers only log during a race, so the
+// variable is read once, at the first call made in a race. The bridge's _putenv (--diag-settimg) lands at the
+// first real GFX task, well before any race, so it is still seen.
+static bool GdxSetTimgTraceOn() {
+    static int sState = -1;
+    if (sState < 0) {
+        if (gGdxRaceActive == 0) {
+            return false;
+        }
+        sState = std::getenv("GDX_DIAG_SETTIMG") != nullptr ? 1 : 0;
+    }
+    return sState != 0;
+}
 // Ring buffer of recent tile writes; flushed to disk only when a suspect draw
 // fires, so the trace shows exactly the SETTILE history leading to that draw.
 #include <deque>
@@ -810,10 +825,42 @@ static uint32_t GetEffectiveLineSize(uint32_t lineSizeBytes, uint32_t fullImageL
     return tileLineSizeBytes;
 }
 
+#ifdef _WIN32
+// Bumped by Interpreter::StartFrame: the readable regions TmemSourceReadableLimit found are kept for one frame.
+static uint32_t sTmemRegionFrame = 0;
+#endif
+
 // Readable-extent probe for TMEM mirror copies: bounds a source read to the
 // committed memory region so a lying transfer size can never fault.
+//
+// VirtualQuery is a system call, and this runs on every LoadBlock and LoadTile: a screen of
+// text (the G-NET room) makes hundreds a frame, which cost several milliseconds a frame. The
+// sources of a frame sit in a handful of regions, so the readable ones found are kept until the
+// next frame starts. No game code runs while a frame is interpreted, so none of them is freed or
+// re-protected under the cache; a region that was not readable is asked again each time.
 static size_t TmemSourceReadableLimit(const uint8_t* addr) {
 #ifdef _WIN32
+    struct Region {
+        uintptr_t base;
+        uintptr_t end;
+    };
+    constexpr int kRegions = 8;
+    static Region sRegions[kRegions];
+    static int sRegionCount = 0;
+    static int sRegionNext = 0;
+    static uint32_t sRegionsFrame = 0;
+
+    const uintptr_t at = reinterpret_cast<uintptr_t>(addr);
+    if (sRegionsFrame != sTmemRegionFrame) {
+        sRegionsFrame = sTmemRegionFrame;
+        sRegionCount = 0;
+        sRegionNext = 0;
+    }
+    for (int i = 0; i < sRegionCount; i++) {
+        if (at >= sRegions[i].base && at < sRegions[i].end) {
+            return static_cast<size_t>(sRegions[i].end - at);
+        }
+    }
     MEMORY_BASIC_INFORMATION mbi;
     if (VirtualQuery(addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
         const bool readable = (mbi.State == MEM_COMMIT) &&
@@ -822,8 +869,14 @@ static size_t TmemSourceReadableLimit(const uint8_t* addr) {
         if (!readable) {
             return 0;
         }
-        const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        return static_cast<size_t>(regionEnd - reinterpret_cast<uintptr_t>(addr));
+        const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+        sRegions[sRegionNext] = { regionBase, regionEnd };
+        sRegionNext = (sRegionNext + 1) % kRegions;
+        if (sRegionCount < kRegions) {
+            sRegionCount++;
+        }
+        return static_cast<size_t>(regionEnd - at);
     }
 #endif
     return SIZE_MAX;
@@ -2194,7 +2247,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     // run shows whether this tile's tmem base selected the load that populated
     // it (same env gate as the SETTIMG race trace).
     {
-        const bool sTmemTrace = std::getenv("GDX_DIAG_SETTIMG") != nullptr; // live read, see store log
+        const bool sTmemTrace = GdxSetTimgTraceOn();
         // Effect tiles 1-4 get their own gate (GDX_DIAG_EFFECTTILE) and budget so
         // this probe cannot be starved by env ordering or the shared log caps.
         static const bool sDiagEffectTile = std::getenv("GDX_DIAG_EFFECTTILE") != nullptr;
@@ -4630,9 +4683,7 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
         return;
     }
 
-    // Live getenv, not static-once: the bridge exports GDX_DIAG_SETTIMG via _putenv at the first
-    // real GFX task, and boot frames import textures before that.
-    const bool sTmemTrace = std::getenv("GDX_DIAG_SETTIMG") != nullptr;
+    const bool sTmemTrace = GdxSetTimgTraceOn(); // latched at the first race call, see GdxSetTimgTraceOn
     if (sTmemTrace && gGdxRaceActive != 0) { // race-gated: boot stores ate the whole budget otherwise
         static int sTmemStoreLogs = 0;
         if (sTmemStoreLogs < 400) {
@@ -7740,6 +7791,9 @@ bool Interpreter::ViewportMatchesRendererResolution() {
 static bool sGameFbMsaaResolvedSized = false;
 
 void Interpreter::StartFrame() {
+#ifdef _WIN32
+    sTmemRegionFrame++; // the readable regions found last frame are asked again (TmemSourceReadableLimit)
+#endif
     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
                          &mCurWindowPosY);
     if (mCurDimensions.height == 0) {
